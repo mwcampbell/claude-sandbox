@@ -1,0 +1,81 @@
+#!/bin/sh
+# Entrypoint for the claude-sandbox image: starts the Docker daemon, then
+# execs the requested command as the agent user.
+#
+# smolvm packs don't carry the image's USER or ENV, so under smolvm this
+# starts as root with a bare environment. It restores the image's environment
+# from /etc/sandbox-env (written at build time) and drops to the agent user
+# itself. Started as agent (e.g. by `docker run`), it uses sudo instead.
+#
+# Under smolvm the image's root filesystem is an overlay, and Docker's own
+# overlay2 snapshotter can't stack on top of that. The machine's ext4 data
+# disk is mounted at /workspace, so Docker's and containerd's state get
+# bind-mounted from there.
+
+set -u
+
+AGENT=agent
+DATA_DISK=/workspace
+
+if [ "$(id -u)" = 0 ]; then
+    as_root() { "$@"; }
+else
+    as_root() { sudo "$@"; }
+fi
+
+start_dockerd() {
+    if as_root docker info >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if [ "$(stat -f -c %T "$DATA_DISK" 2>/dev/null)" = "ext2/ext3" ]; then
+        for d in docker containerd; do
+            as_root mkdir -p "$DATA_DISK/.sandbox/$d" "/var/lib/$d"
+            mountpoint -q "/var/lib/$d" ||
+                as_root mount --bind "$DATA_DISK/.sandbox/$d" "/var/lib/$d"
+        done
+    else
+        echo "sandbox: $DATA_DISK is not an ext4 disk; Docker may fail to start" >&2
+    fi
+
+    as_root rm -f /var/run/docker.pid /run/containerd/containerd.pid
+    as_root sh -c 'setsid dockerd >/var/log/dockerd.log 2>&1 &'
+
+    i=0
+    while [ $i -lt 30 ]; do
+        as_root docker info >/dev/null 2>&1 && return 0
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "sandbox: dockerd did not come up; see /var/log/dockerd.log" >&2
+    return 1
+}
+
+# smolvm names every guest "container" without a matching hosts entry, which
+# makes sudo complain on every call
+if ! grep -q "[[:space:]]$(hostname)\$" /etc/hosts; then
+    as_root sh -c "echo '127.0.1.1 $(hostname)' >> /etc/hosts"
+fi
+
+if [ "${SANDBOX_DOCKER:-1}" = 1 ]; then
+    start_dockerd
+fi
+
+home=$(getent passwd "$AGENT" | cut -d: -f6)
+
+# Write a .gitconfig handed in by the launcher (a single file can't be mounted)
+if [ -n "${SANDBOX_GITCONFIG_B64:-}" ]; then
+    printf '%s' "$SANDBOX_GITCONFIG_B64" | base64 -d | as_root tee "$home/.gitconfig" >/dev/null
+    as_root chown "$AGENT:$AGENT" "$home/.gitconfig"
+fi
+unset SANDBOX_GITCONFIG_B64 SANDBOX_DOCKER
+
+if [ "$(id -u)" = 0 ]; then
+    set -a
+    . /etc/sandbox-env
+    set +a
+    export HOME="$home" USER="$AGENT" LOGNAME="$AGENT" SHELL=/usr/bin/zsh
+    exec setpriv --reuid="$AGENT" --regid="$AGENT" --init-groups -- "$@"
+fi
+
+exec "$@"

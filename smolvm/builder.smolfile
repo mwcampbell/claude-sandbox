@@ -1,0 +1,14 @@
+# Builder machine: a bare Alpine microVM running dockerd, used only to turn the
+# Dockerfile into a `docker save` archive that smolvm can boot. This keeps the
+# host free of any Docker requirement.
+cpus = 4
+memory = 3072
+storage = 40
+net = true
+net_backend = "virtio-net"
+
+[dev]
+init = [
+    "apk update -q",
+    "apk add -q docker docker-cli-buildx",
+]

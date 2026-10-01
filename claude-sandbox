@@ -1,0 +1,171 @@
+#!/bin/sh
+# Run Claude Code in a smolvm microVM, with the current directory mounted at
+# /home/agent/project and Docker Engine running inside the VM.
+#
+# usage: claude-sandbox                 run Claude Code in $PWD
+#        claude-sandbox shell           run an interactive zsh instead
+#        claude-sandbox run CMD [ARG..] run any command instead
+#        claude-sandbox build           (re)build the sandbox image
+#        claude-sandbox clean           delete the builder VM and built image
+#
+# Each session is an ephemeral VM, discarded on exit (like `docker run --rm`).
+# Only the project directory is shared with the host.
+#
+# Building needs no Docker on the host: the Dockerfile is built by dockerd in
+# a separate, persistent builder microVM (which keeps the layer cache), then
+# packed into a .smolmachine that sessions boot from.
+#
+# Environment:
+#   CLAUDE_SANDBOX_CPUS     vCPU cap (default: 4)
+#   CLAUDE_SANDBOX_MEM      memory cap in MiB (default: 4096; only touched
+#                           memory is committed on the host)
+#   CLAUDE_SANDBOX_STORAGE  per-session disk in GiB, holds Docker's images and
+#                           containers (default: 20)
+#   CLAUDE_SANDBOX_HOME     state directory (default: ~/.cache/claude-sandbox)
+
+set -eu
+
+# Find the checkout this script lives in, following symlinks, so it can be
+# symlinked into a directory on $PATH and still find the Dockerfile
+self=$0
+while [ -L "$self" ]; do
+    link=$(readlink "$self")
+    case "$link" in
+        /*) self=$link ;;
+        *)  self=$(dirname "$self")/$link ;;
+    esac
+done
+SRC_DIR=$(cd "$(dirname "$self")" && pwd -P)
+STATE_DIR=${CLAUDE_SANDBOX_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-sandbox}
+PACK=$STATE_DIR/claude-sandbox
+BUILDER=claude-sandbox-builder
+
+CPUS=${CLAUDE_SANDBOX_CPUS:-4}
+MEM=${CLAUDE_SANDBOX_MEM:-4096}
+STORAGE=${CLAUDE_SANDBOX_STORAGE:-20}
+
+die() { echo "claude-sandbox: $*" >&2; exit 1; }
+say() { echo "claude-sandbox: $*" >&2; }
+
+command -v smolvm >/dev/null 2>&1 ||
+    die "smolvm not found; install it with: curl -sSL https://smolmachines.com/install.sh | bash"
+
+builder_exists() { smolvm machine ls --quiet 2>/dev/null | grep -qx "$BUILDER"; }
+
+delete_builder() {
+    if builder_exists; then
+        smolvm machine stop --name "$BUILDER" >/dev/null 2>&1 || true
+        smolvm machine delete --name "$BUILDER" --force >/dev/null
+    fi
+}
+
+build() {
+    [ -f "$SRC_DIR/Dockerfile" ] && [ -f "$SRC_DIR/smolvm/builder.smolfile" ] ||
+        die "can't build: no Dockerfile in $SRC_DIR (symlink this script onto your PATH rather than copying it)"
+
+    mkdir -p "$STATE_DIR"
+
+    # Mounts are fixed when a machine is created, so recreate the builder if
+    # this checkout has moved since it was made.
+    if builder_exists && [ "$(cat "$STATE_DIR/builder-src" 2>/dev/null)" != "$SRC_DIR" ]; then
+        say "source directory changed; recreating builder VM"
+        delete_builder
+    fi
+    if ! builder_exists; then
+        say "creating builder VM"
+        smolvm machine create --name "$BUILDER" -s "$SRC_DIR/smolvm/builder.smolfile" \
+            -v "$SRC_DIR:/src:ro" -v "$STATE_DIR:/out" >/dev/null
+        echo "$SRC_DIR" > "$STATE_DIR/builder-src"
+    fi
+
+    say "starting builder VM"
+    smolvm machine start --name "$BUILDER" >/dev/null
+    trap 'smolvm machine stop --name "$BUILDER" >/dev/null 2>&1 || true' EXIT
+
+    # dockerd's state must be on the ext4 storage disk (/storage): the bare
+    # VM's root is an overlay that Docker's overlay2 can't stack on. Bind
+    # mounts don't survive a VM restart, so redo them every time.
+    smolvm machine exec --name "$BUILDER" -- sh -c '
+        set -e
+        for d in docker containerd; do
+            mkdir -p /storage/$d /var/lib/$d
+            mountpoint -q /var/lib/$d || mount --bind /storage/$d /var/lib/$d
+        done
+        if ! docker info >/dev/null 2>&1; then
+            rm -f /var/run/docker.pid
+            setsid dockerd >/var/log/dockerd.log 2>&1 &
+            for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+        fi
+        docker info >/dev/null' ||
+        die "dockerd failed to start in the builder VM"
+
+    say "building image (this takes a while the first time)"
+    smolvm machine exec --stream --name "$BUILDER" -- \
+        docker build --progress=plain -t claude-sandbox \
+        --build-arg AGENT_UID="$(id -u)" --build-arg AGENT_GID="$(id -g)" /src ||
+        die "image build failed"
+
+    say "exporting image"
+    smolvm machine exec --name "$BUILDER" -- sh -c '
+        docker save -o /out/image.tar claude-sandbox && docker image prune -f >/dev/null' ||
+        die "image export failed"
+
+    smolvm machine stop --name "$BUILDER" >/dev/null
+    trap - EXIT
+
+    # smolvm can only pack a local image archive by way of a machine that has
+    # been booted once (the first boot unpacks the image onto its disk)
+    say "packing image into $PACK.smolmachine (slow: unpacks and recompresses it)"
+    tmp=claude-sandbox-pack-$$
+    trap 'smolvm machine delete --name "$tmp" --force >/dev/null 2>&1 || true' EXIT
+    smolvm machine create --name "$tmp" --image "$STATE_DIR/image.tar" \
+        --cpus "$CPUS" --mem "$MEM" -- sleep infinity >/dev/null &&
+    smolvm machine start --name "$tmp" >/dev/null &&
+    smolvm machine stop --name "$tmp" >/dev/null &&
+    rm -f "$PACK" "$PACK.smolmachine" &&
+    smolvm pack create --from-vm "$tmp" -o "$PACK" >/dev/null ||
+        die "smolvm pack failed"
+    smolvm machine delete --name "$tmp" --force >/dev/null
+    trap - EXIT
+    rm -f "$STATE_DIR/image.tar"
+    smolvm pack prune >/dev/null 2>&1 || true
+    say "done"
+}
+
+run() {
+    [ -f "$PACK.smolmachine" ] || {
+        say "no sandbox image yet; building it first"
+        build
+    }
+
+    set -- \
+        --from "$PACK.smolmachine" \
+        --cpus "$CPUS" --mem "$MEM" --storage "$STORAGE" \
+        --net --net-backend virtio-net \
+        -v "$PWD:/home/agent/project" -w /home/agent/project \
+        -e "TERM=${TERM:-xterm-256color}" \
+        "$@"
+
+    # virtiofs can only share directories, so hand ~/.gitconfig over by value
+    if [ -f "$HOME/.gitconfig" ]; then
+        set -- -e "SANDBOX_GITCONFIG_B64=$(base64 < "$HOME/.gitconfig" | tr -d '\n')" "$@"
+    fi
+
+    if [ -t 0 ]; then
+        set -- -i -t "$@"
+    fi
+
+    exec smolvm machine run "$@"
+}
+
+# smolvm packs don't keep the image's ENTRYPOINT/CMD, so spell them out here
+case "${1:-}" in
+    "")    run -- /usr/local/bin/sandbox-entrypoint \
+               claude --dangerously-skip-permissions --ax-screen-reader --remote-control ;;
+    shell) run -- /usr/local/bin/sandbox-entrypoint zsh -l ;;
+    run)   shift; [ $# -gt 0 ] || die "usage: claude-sandbox run CMD [ARG...]"
+           run -- /usr/local/bin/sandbox-entrypoint "$@" ;;
+    build) build ;;
+    clean) delete_builder; rm -rf "$STATE_DIR"; smolvm pack prune >/dev/null 2>&1 || true ;;
+    *)     die "unknown command: $1 (try build, shell, run, clean)" ;;
+esac
