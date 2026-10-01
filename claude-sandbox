@@ -1,171 +1,394 @@
-#!/bin/sh
-# Run Claude Code in a smolvm microVM, with the current directory mounted at
-# /home/agent/project and Docker Engine running inside the VM.
-#
-# usage: claude-sandbox                 run Claude Code in $PWD
-#        claude-sandbox shell           run an interactive zsh instead
-#        claude-sandbox run CMD [ARG..] run any command instead
-#        claude-sandbox build           (re)build the sandbox image
-#        claude-sandbox clean           delete the builder VM and built image
-#
-# Each session is an ephemeral VM, discarded on exit (like `docker run --rm`).
-# Only the project directory is shared with the host.
-#
-# Building needs no Docker on the host: the Dockerfile is built by dockerd in
-# a separate, persistent builder microVM (which keeps the layer cache), then
-# packed into a .smolmachine that sessions boot from.
-#
-# Environment:
-#   CLAUDE_SANDBOX_CPUS     vCPU cap (default: 4)
-#   CLAUDE_SANDBOX_MEM      memory cap in MiB (default: 4096; only touched
-#                           memory is committed on the host)
-#   CLAUDE_SANDBOX_STORAGE  per-session disk in GiB, holds Docker's images and
-#                           containers (default: 20)
-#   CLAUDE_SANDBOX_HOME     state directory (default: ~/.cache/claude-sandbox)
+#!/usr/bin/env python3
+"""Run Claude Code in a smolvm microVM, with the current directory mounted at
+/home/agent/project and Docker Engine running inside the VM.
 
-set -eu
+Each session is an ephemeral VM, discarded on exit (like `docker run --rm`).
+Only the project directory is shared with the host, plus, for sessions that
+use a login profile, a scratch copy of that profile.
 
-# Find the checkout this script lives in, following symlinks, so it can be
+Building needs no Docker on the host: the Dockerfile is built by dockerd in a
+separate, persistent builder microVM (which keeps the layer cache), then
+packed into a .smolmachine that sessions boot from.
+"""
+
+import argparse
+import base64
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+
+# The checkout this script lives in, following symlinks, so the script can be
 # symlinked into a directory on $PATH and still find the Dockerfile
-self=$0
-while [ -L "$self" ]; do
-    link=$(readlink "$self")
-    case "$link" in
-        /*) self=$link ;;
-        *)  self=$(dirname "$self")/$link ;;
-    esac
-done
-SRC_DIR=$(cd "$(dirname "$self")" && pwd -P)
-STATE_DIR=${CLAUDE_SANDBOX_HOME:-${XDG_CACHE_HOME:-$HOME/.cache}/claude-sandbox}
-PACK=$STATE_DIR/claude-sandbox
-BUILDER=claude-sandbox-builder
+SRC_DIR = os.path.dirname(os.path.realpath(__file__))
 
-CPUS=${CLAUDE_SANDBOX_CPUS:-4}
-MEM=${CLAUDE_SANDBOX_MEM:-4096}
-STORAGE=${CLAUDE_SANDBOX_STORAGE:-20}
+HOME = os.path.expanduser("~")
+STATE_DIR = os.environ.get("CLAUDE_SANDBOX_HOME") or os.path.join(
+    os.environ.get("XDG_CACHE_HOME") or os.path.join(HOME, ".cache"), "claude-sandbox")
+PROFILES_DIR = os.environ.get("CLAUDE_SANDBOX_PROFILES") or os.path.join(
+    os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
+    "claude-sandbox", "profiles")
+PACK = os.path.join(STATE_DIR, "claude-sandbox")
+BUILDER = "claude-sandbox-builder"
 
-die() { echo "claude-sandbox: $*" >&2; exit 1; }
-say() { echo "claude-sandbox: $*" >&2; }
+CPUS = os.environ.get("CLAUDE_SANDBOX_CPUS", "4")
+MEM = os.environ.get("CLAUDE_SANDBOX_MEM", "4096")
+STORAGE = os.environ.get("CLAUDE_SANDBOX_STORAGE", "20")
 
-command -v smolvm >/dev/null 2>&1 ||
-    die "smolvm not found; install it with: curl -sSL https://smolmachines.com/install.sh | bash"
+ENTRYPOINT = "/usr/local/bin/sandbox-entrypoint"
+# smolvm packs don't keep the image's ENTRYPOINT/CMD, so spell them out here
+CLAUDE_CMD = ["claude", "--dangerously-skip-permissions", "--ax-screen-reader",
+              "--remote-control"]
 
-builder_exists() { smolvm machine ls --quiet 2>/dev/null | grep -qx "$BUILDER"; }
+GUEST_PROJECT = "/home/agent/project"
+GUEST_PROFILE = "/mnt/sandbox-profile"
 
-delete_builder() {
-    if builder_exists; then
-        smolvm machine stop --name "$BUILDER" >/dev/null 2>&1 || true
-        smolvm machine delete --name "$BUILDER" --force >/dev/null
-    fi
-}
+PROFILE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 
-build() {
-    [ -f "$SRC_DIR/Dockerfile" ] && [ -f "$SRC_DIR/smolvm/builder.smolfile" ] ||
-        die "can't build: no Dockerfile in $SRC_DIR (symlink this script onto your PATH rather than copying it)"
 
-    mkdir -p "$STATE_DIR"
+class Error(Exception):
+    pass
+
+
+def say(msg):
+    print("claude-sandbox: " + msg, file=sys.stderr)
+
+
+def smolvm(*args, check=True, quiet=False):
+    """Run a smolvm command; quiet discards its stdout (progress on stderr
+    still shows, which is useful during slow steps)."""
+    result = subprocess.run(["smolvm"] + list(args),
+                            stdout=subprocess.DEVNULL if quiet else None)
+    if check and result.returncode != 0:
+        raise Error("smolvm {} failed".format(" ".join(args[:2])))
+    return result.returncode
+
+
+def smolvm_output(*args):
+    return subprocess.run(["smolvm"] + list(args), stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, universal_newlines=True).stdout
+
+
+# --- building ---------------------------------------------------------------
+
+def builder_exists():
+    return BUILDER in smolvm_output("machine", "ls", "--quiet").split()
+
+
+def delete_builder():
+    if builder_exists():
+        smolvm("machine", "stop", "--name", BUILDER, check=False, quiet=True)
+        smolvm("machine", "delete", "--name", BUILDER, "--force", quiet=True)
+
+
+def build():
+    if not (os.path.isfile(os.path.join(SRC_DIR, "Dockerfile"))
+            and os.path.isfile(os.path.join(SRC_DIR, "smolvm", "builder.smolfile"))):
+        raise Error("can't build: no Dockerfile in {} (symlink this script onto "
+                    "your PATH rather than copying it)".format(SRC_DIR))
+
+    os.makedirs(STATE_DIR, exist_ok=True)
+    src_record = os.path.join(STATE_DIR, "builder-src")
 
     # Mounts are fixed when a machine is created, so recreate the builder if
-    # this checkout has moved since it was made.
-    if builder_exists && [ "$(cat "$STATE_DIR/builder-src" 2>/dev/null)" != "$SRC_DIR" ]; then
-        say "source directory changed; recreating builder VM"
-        delete_builder
-    fi
-    if ! builder_exists; then
-        say "creating builder VM"
-        smolvm machine create --name "$BUILDER" -s "$SRC_DIR/smolvm/builder.smolfile" \
-            -v "$SRC_DIR:/src:ro" -v "$STATE_DIR:/out" >/dev/null
-        echo "$SRC_DIR" > "$STATE_DIR/builder-src"
-    fi
+    # this checkout has moved since it was made
+    if builder_exists() and read_text(src_record) != SRC_DIR:
+        say("source directory changed; recreating builder VM")
+        delete_builder()
+    if not builder_exists():
+        say("creating builder VM")
+        smolvm("machine", "create", "--name", BUILDER,
+               "-s", os.path.join(SRC_DIR, "smolvm", "builder.smolfile"),
+               "-v", SRC_DIR + ":/src:ro", "-v", STATE_DIR + ":/out", quiet=True)
+        write_text(src_record, SRC_DIR)
 
-    say "starting builder VM"
-    smolvm machine start --name "$BUILDER" >/dev/null
-    trap 'smolvm machine stop --name "$BUILDER" >/dev/null 2>&1 || true' EXIT
+    say("starting builder VM")
+    smolvm("machine", "start", "--name", BUILDER, quiet=True)
+    try:
+        # dockerd's state must be on the ext4 storage disk (/storage): the
+        # bare VM's root is an overlay that Docker's overlay2 can't stack on.
+        # Bind mounts don't survive a VM restart, so redo them every time.
+        if smolvm("machine", "exec", "--name", BUILDER, "--", "sh", "-c", """
+            set -e
+            for d in docker containerd; do
+                mkdir -p /storage/$d /var/lib/$d
+                mountpoint -q /var/lib/$d || mount --bind /storage/$d /var/lib/$d
+            done
+            if ! docker info >/dev/null 2>&1; then
+                rm -f /var/run/docker.pid
+                setsid dockerd >/var/log/dockerd.log 2>&1 &
+                for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
+            fi
+            docker info >/dev/null""", check=False) != 0:
+            raise Error("dockerd failed to start in the builder VM")
 
-    # dockerd's state must be on the ext4 storage disk (/storage): the bare
-    # VM's root is an overlay that Docker's overlay2 can't stack on. Bind
-    # mounts don't survive a VM restart, so redo them every time.
-    smolvm machine exec --name "$BUILDER" -- sh -c '
-        set -e
-        for d in docker containerd; do
-            mkdir -p /storage/$d /var/lib/$d
-            mountpoint -q /var/lib/$d || mount --bind /storage/$d /var/lib/$d
-        done
-        if ! docker info >/dev/null 2>&1; then
-            rm -f /var/run/docker.pid
-            setsid dockerd >/var/log/dockerd.log 2>&1 &
-            for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
-        fi
-        docker info >/dev/null' ||
-        die "dockerd failed to start in the builder VM"
+        say("building image (this takes a while the first time)")
+        if smolvm("machine", "exec", "--stream", "--name", BUILDER, "--",
+                  "docker", "build", "--progress=plain", "-t", "claude-sandbox",
+                  "--build-arg", "AGENT_UID={}".format(os.getuid()),
+                  "--build-arg", "AGENT_GID={}".format(os.getgid()),
+                  "/src", check=False) != 0:
+            raise Error("image build failed")
 
-    say "building image (this takes a while the first time)"
-    smolvm machine exec --stream --name "$BUILDER" -- \
-        docker build --progress=plain -t claude-sandbox \
-        --build-arg AGENT_UID="$(id -u)" --build-arg AGENT_GID="$(id -g)" /src ||
-        die "image build failed"
-
-    say "exporting image"
-    smolvm machine exec --name "$BUILDER" -- sh -c '
-        docker save -o /out/image.tar claude-sandbox && docker image prune -f >/dev/null' ||
-        die "image export failed"
-
-    smolvm machine stop --name "$BUILDER" >/dev/null
-    trap - EXIT
+        say("exporting image")
+        if smolvm("machine", "exec", "--name", BUILDER, "--", "sh", "-c",
+                  "docker save -o /out/image.tar claude-sandbox && "
+                  "docker image prune -f >/dev/null", check=False) != 0:
+            raise Error("image export failed")
+    finally:
+        smolvm("machine", "stop", "--name", BUILDER, check=False, quiet=True)
 
     # smolvm can only pack a local image archive by way of a machine that has
     # been booted once (the first boot unpacks the image onto its disk)
-    say "packing image into $PACK.smolmachine (slow: unpacks and recompresses it)"
-    tmp=claude-sandbox-pack-$$
-    trap 'smolvm machine delete --name "$tmp" --force >/dev/null 2>&1 || true' EXIT
-    smolvm machine create --name "$tmp" --image "$STATE_DIR/image.tar" \
-        --cpus "$CPUS" --mem "$MEM" -- sleep infinity >/dev/null &&
-    smolvm machine start --name "$tmp" >/dev/null &&
-    smolvm machine stop --name "$tmp" >/dev/null &&
-    rm -f "$PACK" "$PACK.smolmachine" &&
-    smolvm pack create --from-vm "$tmp" -o "$PACK" >/dev/null ||
-        die "smolvm pack failed"
-    smolvm machine delete --name "$tmp" --force >/dev/null
-    trap - EXIT
-    rm -f "$STATE_DIR/image.tar"
-    smolvm pack prune >/dev/null 2>&1 || true
-    say "done"
-}
+    say("packing image into {}.smolmachine (slow: unpacks and recompresses it)"
+        .format(PACK))
+    image = os.path.join(STATE_DIR, "image.tar")
+    tmp = "claude-sandbox-pack-{}".format(os.getpid())
+    try:
+        smolvm("machine", "create", "--name", tmp, "--image", image,
+               "--cpus", CPUS, "--mem", MEM, "--", "sleep", "infinity", quiet=True)
+        smolvm("machine", "start", "--name", tmp, quiet=True)
+        smolvm("machine", "stop", "--name", tmp, quiet=True)
+        for path in (PACK, PACK + ".smolmachine"):
+            remove(path)
+        smolvm("pack", "create", "--from-vm", tmp, "-o", PACK, quiet=True)
+    finally:
+        smolvm("machine", "delete", "--name", tmp, "--force", check=False, quiet=True)
+    remove(image)
+    smolvm("pack", "prune", check=False, quiet=True)
+    say("done")
 
-run() {
-    [ -f "$PACK.smolmachine" ] || {
-        say "no sandbox image yet; building it first"
-        build
-    }
 
-    set -- \
-        --from "$PACK.smolmachine" \
-        --cpus "$CPUS" --mem "$MEM" --storage "$STORAGE" \
-        --net --net-backend virtio-net \
-        -v "$PWD:/home/agent/project" -w /home/agent/project \
-        -e "TERM=${TERM:-xterm-256color}" \
-        "$@"
+# --- profiles ---------------------------------------------------------------
+
+def profile_dir(name):
+    if not PROFILE_NAME.match(name):
+        raise Error("invalid profile name: {!r} (use letters, digits, '.', '_' "
+                    "and '-')".format(name))
+    return os.path.join(PROFILES_DIR, name)
+
+
+def list_profiles():
+    if not os.path.isdir(PROFILES_DIR):
+        return []
+    return sorted(n for n in os.listdir(PROFILES_DIR)
+                  if os.path.isfile(os.path.join(PROFILES_DIR, n, "credentials.json")))
+
+
+def load_json(path):
+    """Parse a JSON object written by the VM; None if missing or malformed."""
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def save_json(path, data):
+    """Write a private JSON file atomically."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f, indent=2)
+            f.write("\n")
+        os.replace(tmp, path)
+    except BaseException:
+        remove(tmp)
+        raise
+
+
+def save_profile(directory, out, login):
+    """Keep the login state a session handed back in out/.
+
+    After a login, keep the credentials and ~/.claude.json minus its
+    per-project records (history, trust), which carry session state. After
+    an ordinary session, keep only the credentials, which Claude Code may
+    have refreshed; nothing else the session changed is kept.
+    """
+    creds = load_json(os.path.join(out, "credentials.json"))
+    if not creds:
+        if login:
+            raise Error("no login was saved (did you log in before quitting?)")
+        return  # e.g. the session ran /logout: keep the stored login
+    save_json(os.path.join(directory, "credentials.json"), creds)
+
+    if login:
+        config = load_json(os.path.join(out, "claude.json")) or {}
+        config.pop("projects", None)
+        save_json(os.path.join(directory, "claude.json"), config)
+
+
+# --- sessions ---------------------------------------------------------------
+
+def session(command, profile=None, login=False):
+    if profile:
+        directory = profile_dir(profile)
+        if not login and not os.path.isfile(os.path.join(directory, "credentials.json")):
+            raise Error("no profile named {!r}; create it with: claude-sandbox "
+                        "login {}".format(profile, profile))
+
+    if not os.path.isfile(PACK + ".smolmachine"):
+        say("no sandbox image yet; building it first")
+        build()
+
+    args = ["machine", "run", "--from", PACK + ".smolmachine",
+            "--cpus", CPUS, "--mem", MEM, "--storage", STORAGE,
+            "--net", "--net-backend", "virtio-net",
+            "-v", os.getcwd() + ":" + GUEST_PROJECT, "-w", GUEST_PROJECT,
+            "-e", "TERM=" + os.environ.get("TERM", "xterm-256color")]
+    if sys.stdin.isatty():
+        args += ["-i", "-t"]
 
     # virtiofs can only share directories, so hand ~/.gitconfig over by value
-    if [ -f "$HOME/.gitconfig" ]; then
-        set -- -e "SANDBOX_GITCONFIG_B64=$(base64 < "$HOME/.gitconfig" | tr -d '\n')" "$@"
-    fi
+    gitconfig = os.path.join(HOME, ".gitconfig")
+    if os.path.isfile(gitconfig):
+        with open(gitconfig, "rb") as f:
+            args += ["-e", "SANDBOX_GITCONFIG_B64=" + base64.b64encode(f.read()).decode()]
 
-    if [ -t 0 ]; then
-        set -- -i -t "$@"
-    fi
+    scratch = None
+    try:
+        if profile:
+            os.makedirs(directory, mode=0o700, exist_ok=True)
+            # The VM gets a scratch copy, not the profile itself, so all it can
+            # do to the stored profile is hand back files for save_profile()
+            scratch = tempfile.mkdtemp(prefix=".session-", dir=directory)
+            if not login:
+                for name in ("credentials.json", "claude.json"):
+                    src = os.path.join(directory, name)
+                    if os.path.isfile(src):
+                        shutil.copy(src, scratch)
+            args += ["-v", scratch + ":" + GUEST_PROFILE,
+                     "-e", "SANDBOX_PROFILE_DIR=" + GUEST_PROFILE]
 
-    exec smolvm machine run "$@"
-}
+        args += ["--", ENTRYPOINT] + command
 
-# smolvm packs don't keep the image's ENTRYPOINT/CMD, so spell them out here
-case "${1:-}" in
-    "")    run -- /usr/local/bin/sandbox-entrypoint \
-               claude --dangerously-skip-permissions --ax-screen-reader --remote-control ;;
-    shell) run -- /usr/local/bin/sandbox-entrypoint zsh -l ;;
-    run)   shift; [ $# -gt 0 ] || die "usage: claude-sandbox run CMD [ARG...]"
-           run -- /usr/local/bin/sandbox-entrypoint "$@" ;;
-    build) build ;;
-    clean) delete_builder; rm -rf "$STATE_DIR"; smolvm pack prune >/dev/null 2>&1 || true ;;
-    *)     die "unknown command: $1 (try build, shell, run, clean)" ;;
-esac
+        # Keystrokes go to the guest through the raw TTY, but don't let a
+        # stray SIGINT kill this process before it saves the profile. A
+        # handler (unlike SIG_IGN) isn't inherited by smolvm.
+        signal.signal(signal.SIGINT, lambda *_: None)
+        status = smolvm(*args, check=False)
+
+        if profile:
+            save_profile(directory, os.path.join(scratch, "out"), login)
+            if login:
+                say("saved profile {!r}".format(profile))
+        return status
+    finally:
+        if scratch:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+# --- helpers ----------------------------------------------------------------
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return None
+
+
+def write_text(path, text):
+    with open(path, "w") as f:
+        f.write(text + "\n")
+
+
+def remove(path):
+    try:
+        os.remove(path)
+    except FileNotFoundError:
+        pass
+
+
+# --- command line -----------------------------------------------------------
+
+USAGE = """\
+usage: claude-sandbox run PROFILE          run Claude Code in the current directory
+       claude-sandbox login PROFILE        log in and save a profile (e.g. personal, work)
+       claude-sandbox profiles             list saved profiles
+       claude-sandbox shell [PROFILE]      run zsh instead
+       claude-sandbox exec CMD [ARG...]    run any command, without a profile
+       claude-sandbox build                (re)build the sandbox image
+       claude-sandbox clean                delete the builder VM and built image
+
+Profiles hold a Claude Code login, so sessions start logged in. Nothing else
+from a session's ~/.claude is kept: no history, memories or settings changes.
+
+Environment:
+  CLAUDE_SANDBOX_CPUS      vCPU cap (default: 4)
+  CLAUDE_SANDBOX_MEM       memory cap in MiB (default: 4096; only touched
+                           memory is committed on the host)
+  CLAUDE_SANDBOX_STORAGE   per-session disk in GiB, holds Docker's images and
+                           containers (default: 20)
+  CLAUDE_SANDBOX_HOME      image and builder state
+                           (default: ~/.cache/claude-sandbox)
+  CLAUDE_SANDBOX_PROFILES  saved profiles
+                           (default: ~/.config/claude-sandbox/profiles)
+"""
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(prog="claude-sandbox", usage=USAGE, add_help=False)
+    parser.add_argument("command", nargs="?")
+    parser.add_argument("args", nargs=argparse.REMAINDER)
+    opts = parser.parse_args(argv)
+    cmd, args = opts.command, opts.args
+
+    def want(lo, hi):
+        if not lo <= len(args) <= hi:
+            sys.stderr.write(USAGE)
+            raise SystemExit(2)
+
+    if cmd in (None, "help", "-h", "--help"):
+        sys.stdout.write(USAGE)
+        return 0 if cmd else 2
+
+    if shutil.which("smolvm") is None:
+        raise Error("smolvm not found; install it with: "
+                    "curl -sSL https://smolmachines.com/install.sh | bash")
+
+    if cmd == "run":
+        want(1, 1)
+        return session(CLAUDE_CMD, profile=args[0])
+    if cmd == "login":
+        want(1, 1)
+        say("log in, then /quit to save the profile")
+        return session(CLAUDE_CMD, profile=args[0], login=True)
+    if cmd == "profiles":
+        want(0, 0)
+        for name in list_profiles():
+            print(name)
+        return 0
+    if cmd == "shell":
+        want(0, 1)
+        return session(["zsh", "-l"], profile=args[0] if args else None)
+    if cmd == "exec":
+        if not args:
+            sys.stderr.write(USAGE)
+            return 2
+        return session(args)
+    if cmd == "build":
+        want(0, 0)
+        build()
+        return 0
+    if cmd == "clean":
+        want(0, 0)
+        delete_builder()
+        shutil.rmtree(STATE_DIR, ignore_errors=True)
+        smolvm("pack", "prune", check=False, quiet=True)
+        return 0
+
+    raise Error("unknown command: {} (try --help)".format(cmd))
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Error as e:
+        say(str(e))
+        sys.exit(1)

@@ -70,12 +70,43 @@ if [ -n "${SANDBOX_GITCONFIG_B64:-}" ]; then
 fi
 unset SANDBOX_GITCONFIG_B64 SANDBOX_DOCKER
 
+# A login profile, when the launcher passes one, is a directory holding
+# Claude Code's credentials and ~/.claude.json. They're installed before the
+# command runs and copied back to $profile/out when it exits, so the launcher
+# can keep a refreshed login. Nothing else from ~/.claude leaves the VM.
+profile=${SANDBOX_PROFILE_DIR:-}
+unset SANDBOX_PROFILE_DIR
+
+if [ -n "$profile" ]; then
+    as_root install -d -o "$AGENT" -g "$AGENT" -m 700 "$home/.claude"
+    [ -f "$profile/credentials.json" ] &&
+        as_root install -o "$AGENT" -g "$AGENT" -m 600 "$profile/credentials.json" "$home/.claude/.credentials.json"
+    [ -f "$profile/claude.json" ] &&
+        as_root install -o "$AGENT" -g "$AGENT" -m 600 "$profile/claude.json" "$home/.claude.json"
+fi
+
 if [ "$(id -u)" = 0 ]; then
     set -a
     . /etc/sandbox-env
     set +a
     export HOME="$home" USER="$AGENT" LOGNAME="$AGENT" SHELL=/usr/bin/zsh
-    exec setpriv --reuid="$AGENT" --regid="$AGENT" --init-groups -- "$@"
+    set -- setpriv --reuid="$AGENT" --regid="$AGENT" --init-groups -- "$@"
 fi
 
-exec "$@"
+if [ -z "$profile" ]; then
+    exec "$@"
+fi
+
+# Stay around to save the login afterwards. A no-op handler (not an ignored
+# signal, which the command would inherit) keeps Ctrl-C from killing this
+# shell while leaving the command's own signal handling alone.
+trap : INT QUIT TERM
+"$@"
+status=$?
+
+as_root mkdir -p "$profile/out"
+[ -f "$home/.claude/.credentials.json" ] &&
+    as_root cp "$home/.claude/.credentials.json" "$profile/out/credentials.json"
+[ -f "$home/.claude.json" ] &&
+    as_root cp "$home/.claude.json" "$profile/out/claude.json"
+exit $status

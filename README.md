@@ -9,7 +9,7 @@ host's Docker.
 
 It's set up for blind users. Claude Code starts in screen reader mode
 (`--ax-screen-reader`) with Remote Control enabled (`--remote-control`). To
-change that, edit the default command near the bottom of `claude-sandbox`.
+change that, edit `CLAUDE_CMD` near the top of `claude-sandbox`.
 
 ## Setup
 
@@ -23,17 +23,29 @@ Symlink the script rather than copying it. Sessions would work from a copy,
 but `build` needs the Dockerfile next to the real script, and it follows the
 symlink to find it.
 
-On Linux your user needs access to `/dev/kvm` (be in the `kvm` group). On
-macOS, smolvm needs Apple silicon. No Docker is needed on the host.
+The launcher is a single Python 3 script using only the standard library
+(Python 3.8 or later, so macOS's built-in `python3` works). On Linux your user
+needs access to `/dev/kvm` (be in the `kvm` group). On macOS, smolvm needs
+Apple silicon. No Docker is needed on the host.
 
 ## Use
 
-From the directory you want the agent to work on:
+First, log in once per Claude account you want to use, giving each a profile
+name of your choosing:
 
 ```sh
-claude-sandbox                  # Claude Code, in an ephemeral VM
-claude-sandbox shell            # zsh in the same environment
-claude-sandbox run CMD [ARG..]  # any other command
+claude-sandbox login personal
+claude-sandbox login work
+```
+
+Each starts a fresh sandbox running Claude Code. Log in, then `/quit`, and
+the login is saved. Then, from the directory you want the agent to work on:
+
+```sh
+claude-sandbox run personal     # Claude Code, logged in as "personal"
+claude-sandbox shell [PROFILE]  # zsh in the same environment
+claude-sandbox exec CMD [ARG..] # any other command, without a profile
+claude-sandbox profiles         # list saved profiles
 claude-sandbox build            # rebuild after editing the Dockerfile
 claude-sandbox clean            # delete the builder VM and built image
 ```
@@ -47,8 +59,31 @@ network access.
 Tunables (environment variables): `CLAUDE_SANDBOX_CPUS` (default 4),
 `CLAUDE_SANDBOX_MEM` in MiB (default 4096; this is a cap, and the host only
 commits what the guest touches), `CLAUDE_SANDBOX_STORAGE` in GiB (default 20;
-holds the agent's Docker images and containers), and `CLAUDE_SANDBOX_HOME`
-(default `~/.cache/claude-sandbox`).
+holds the agent's Docker images and containers), `CLAUDE_SANDBOX_HOME`
+(default `~/.cache/claude-sandbox`), and `CLAUDE_SANDBOX_PROFILES` (default
+`~/.config/claude-sandbox/profiles`).
+
+### Profiles
+
+A profile holds only a Claude Code login, so sessions start logged in, while
+everything else in `~/.claude` stays ephemeral: no session history, resumable
+sessions, memories, or settings changes carry over.
+
+- A profile directory holds two files, readable only by you:
+  `credentials.json`, Claude Code's OAuth tokens, and `claude.json`, the
+  `~/.claude.json` from the login session with its per-project records
+  removed. That keeps the account details and first-run choices (theme,
+  accepting the bypass-permissions warning), so sessions skip onboarding.
+- The VM never sees the profile directory itself. Each session gets a
+  scratch copy. When it ends, the launcher keeps only the credentials, which
+  Claude Code may have refreshed during the session.
+- Running `login` on an existing profile replaces it. To delete a profile,
+  delete its directory.
+- The agent inside the VM can read the login tokens, as it could in any
+  logged-in session.
+- Avoid running two sessions with the same profile at once. Each refreshes
+  its tokens independently, and one may invalidate the other's, which means
+  logging in again.
 
 ## How it works
 
@@ -61,7 +96,9 @@ holds the agent's Docker images and containers), and `CLAUDE_SANDBOX_HOME`
   once in a throwaway machine to unpack it, then `smolvm pack create
   --from-vm`. Sessions are `smolvm machine run --from` that pack.
 - `sandbox-entrypoint` runs at the start of every session: it starts dockerd,
-  then drops to the `agent` user and execs Claude.
+  installs the profile's login files if there are any, then drops to the
+  `agent` user and runs Claude. With a profile, it stays around to hand the
+  login files back when Claude exits.
 
 ### smolvm quirks this works around
 
