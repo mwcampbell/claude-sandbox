@@ -11,40 +11,78 @@ It's set up for blind users. Claude Code starts in screen reader mode
 (`--ax-screen-reader`) with Remote Control enabled (`--remote-control`). To
 change that, edit `CLAUDE_CMD` near the top of `claude-sandbox`.
 
+## Requirements
+
+- **Linux** with KVM (`/dev/kvm` present), or **macOS** on Apple silicon.
+  So far this has been tested only on Linux on arm64 (a Raspberry Pi CM4
+  and an NVIDIA DGX Spark); macOS and x86-64 Linux should work but are
+  untested.
+- **Python 3.8 or later.** The launcher uses only the standard library, so
+  macOS's built-in `python3` works.
+- **git** and **curl**.
+- About **8 GB of RAM** and **10 GB of free disk**. Building uses a VM with
+  up to 3 GB of memory, sessions use up to 4 GB by default, and the built
+  image plus smolvm's caches took about 9 GB.
+- No Docker is needed on the host.
+
 ## Setup
 
-```sh
-curl -sSL https://smolmachines.com/install.sh | bash   # installs smolvm into ~/.smolvm
-./claude-sandbox build                                  # one-time, slow (see below)
-ln -s "$PWD/claude-sandbox" ~/.local/bin/claude-sandbox  # put it on your PATH
-```
+1. On Linux, let your user run VMs. Skip this if `id -nG` already lists
+   `kvm`. Otherwise run the command below, then log out and back in:
 
-Symlink the script rather than copying it. Sessions would work from a copy,
-but `build` needs the Dockerfile next to the real script, and it follows the
-symlink to find it.
+   ```sh
+   sudo usermod -aG kvm "$USER"
+   ```
 
-The launcher is a single Python 3 script using only the standard library
-(Python 3.8 or later, so macOS's built-in `python3` works). On Linux your user
-needs access to `/dev/kvm` (be in the `kvm` group). On macOS, smolvm needs
-Apple silicon. No Docker is needed on the host.
+2. Install [smolvm](https://github.com/smol-machines/smolvm). Its installer
+   puts it in `~/.smolvm`, links it into `~/.local/bin`, and adds that
+   directory to your PATH in your shell profile if it isn't there already.
+   If the installer says it changed your profile, open a new terminal
+   afterwards.
+
+   ```sh
+   curl -sSL https://smolmachines.com/install.sh | bash
+   smolvm --version
+   ```
+
+3. Get this repository and put the launcher on your PATH. Symlink it rather
+   than copying it: sessions would work from a copy, but `build` needs the
+   Dockerfile next to the real script, and it follows the symlink to find
+   it.
+
+   ```sh
+   git clone https://github.com/mwcampbell/claude-sandbox ~/claude-sandbox
+   ln -s ~/claude-sandbox/claude-sandbox ~/.local/bin/claude-sandbox
+   ```
+
+4. Build the sandbox image. This takes a while: about 4 minutes on an
+   NVIDIA DGX Spark, but about 35 minutes on a Raspberry Pi CM4. It prints
+   progress as it goes.
+
+   ```sh
+   claude-sandbox build
+   ```
+
+5. Create a login profile for each Claude account you want to use, named
+   however you like. Each command starts a fresh sandbox running Claude
+   Code. Log in, then `/quit`, and the login is saved. If the browser can't
+   hand the login back to the sandbox, paste the code it shows at the
+   "Paste code here" prompt.
+
+   ```sh
+   claude-sandbox login personal
+   claude-sandbox login work
+   ```
 
 ## Use
 
-First, log in once per Claude account you want to use, giving each a profile
-name of your choosing:
-
-```sh
-claude-sandbox login personal
-claude-sandbox login work
-```
-
-Each starts a fresh sandbox running Claude Code. Log in, then `/quit`, and
-the login is saved. Then, from the directory you want the agent to work on:
+From the directory you want the agent to work on:
 
 ```sh
 claude-sandbox run personal     # Claude Code, logged in as "personal"
 claude-sandbox shell [PROFILE]  # zsh in the same environment
 claude-sandbox exec CMD [ARG..] # any other command, without a profile
+claude-sandbox login PROFILE    # create a profile, or log it in again
 claude-sandbox profiles         # list saved profiles
 claude-sandbox build            # rebuild after editing the Dockerfile
 claude-sandbox clean            # delete the builder VM and built image
@@ -119,7 +157,10 @@ sessions, memories, or settings changes carry over.
   gives the guest no real network interface. smolvm's docs call for
   virtio-net when running a container runtime in the guest.
 
-### Timing (Raspberry Pi CM4, SD card)
+### Timing
+
+A full build from scratch took about 4 minutes 15 seconds on an NVIDIA DGX
+Spark. On a Raspberry Pi CM4 with an SD card, everything is much slower:
 
 - A build from scratch took about 35 minutes. A rebuild that reuses the
   builder's layer cache still took about 27 minutes. Most of that is fixed
