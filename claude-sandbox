@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """Run Claude Code in a smolvm microVM, with the current directory mounted at
-/home/agent/project and Docker Engine running inside the VM.
+/home/agent/project and Docker Engine running inside the VM, or, in container
+mode, in a Docker container on the host with the host's GPUs.
 
-Each session is an ephemeral VM, discarded on exit (like `docker run --rm`).
-Only the project directory is shared with the host, plus, for sessions that
-use a login profile, a scratch copy of that profile.
+Each session is an ephemeral VM or container, discarded on exit (like
+`docker run --rm`). Only the project directory is shared with the host, plus,
+for sessions that use a login profile, a scratch copy of that profile.
 
-Building needs no Docker on the host: the Dockerfile is built by dockerd in a
-separate, persistent builder microVM (which keeps the layer cache), then
-packed into a .smolmachine that sessions boot from.
+Building uses the host's Docker: the Dockerfile is built into the image that
+container sessions run, which is then packed into a .smolmachine that VM
+sessions boot from.
 """
 
 import argparse
@@ -33,14 +34,20 @@ PROFILES_DIR = os.environ.get("CLAUDE_SANDBOX_PROFILES") or os.path.join(
     os.environ.get("XDG_CONFIG_HOME") or os.path.join(HOME, ".config"),
     "claude-sandbox", "profiles")
 PACK = os.path.join(STATE_DIR, "claude-sandbox")
-BUILDER = "claude-sandbox-builder"
+# The ID of the Docker image the pack was made from
+PACK_SOURCE = os.path.join(STATE_DIR, "pack-image-id")
+IMAGE = "claude-sandbox"
+# Machine used for building by earlier versions; `clean` still removes it
+OLD_BUILDER = "claude-sandbox-builder"
 
 CPUS = os.environ.get("CLAUDE_SANDBOX_CPUS", "4")
 MEM = os.environ.get("CLAUDE_SANDBOX_MEM", "4096")
 STORAGE = os.environ.get("CLAUDE_SANDBOX_STORAGE", "20")
+GPUS = os.environ.get("CLAUDE_SANDBOX_GPUS", "all")
 
 ENTRYPOINT = "/usr/local/bin/sandbox-entrypoint"
 # smolvm packs don't keep the image's ENTRYPOINT/CMD, so spell them out here
+# (and pass the same command to containers, for consistency)
 CLAUDE_CMD = ["claude", "--dangerously-skip-permissions", "--ax-screen-reader",
               "--remote-control"]
 
@@ -75,90 +82,77 @@ def smolvm_output(*args):
 
 # --- building ---------------------------------------------------------------
 
-def builder_exists():
-    return BUILDER in smolvm_output("machine", "ls", "--quiet").split()
+def need(tool):
+    if shutil.which(tool) is None:
+        if tool == "smolvm":
+            raise Error("smolvm not found; install it with: "
+                        "curl -sSL https://smolmachines.com/install.sh | bash")
+        raise Error("{} not found".format(tool))
 
 
-def delete_builder():
-    if builder_exists():
-        smolvm("machine", "stop", "--name", BUILDER, check=False, quiet=True)
-        smolvm("machine", "delete", "--name", BUILDER, "--force", quiet=True)
+def image_id():
+    """The ID of the built Docker image, or None if there isn't one."""
+    result = subprocess.run(["docker", "image", "inspect", "--format", "{{.Id}}", IMAGE],
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                            universal_newlines=True)
+    return result.stdout.strip() if result.returncode == 0 else None
 
 
 def build():
-    if not (os.path.isfile(os.path.join(SRC_DIR, "Dockerfile"))
-            and os.path.isfile(os.path.join(SRC_DIR, "smolvm", "builder.smolfile"))):
+    if not os.path.isfile(os.path.join(SRC_DIR, "Dockerfile")):
         raise Error("can't build: no Dockerfile in {} (symlink this script onto "
                     "your PATH rather than copying it)".format(SRC_DIR))
+    need("docker")
+
+    say("building image (this takes a while the first time)")
+    old_id = image_id()
+    # Without provenance attestations, which record the build time, an
+    # unchanged rebuild keeps the same image ID, and the pack can be kept
+    if subprocess.run(["docker", "build", "--progress=plain", "--provenance=false",
+                       "-t", IMAGE,
+                       "--build-arg", "AGENT_UID={}".format(os.getuid()),
+                       "--build-arg", "AGENT_GID={}".format(os.getgid()),
+                       SRC_DIR]).returncode != 0:
+        raise Error("image build failed")
+    new_id = image_id()
+    # Drop the image this one replaced, if nothing else uses it (a container
+    # session that's still running, or another tag)
+    if old_id and old_id != new_id:
+        subprocess.run(["docker", "image", "rm", old_id],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    if shutil.which("smolvm") is None:
+        say("smolvm not found; built the container image only")
+        return
+    if os.path.isfile(PACK + ".smolmachine") and read_text(PACK_SOURCE) == new_id:
+        say("image unchanged; {}.smolmachine is up to date".format(PACK))
+        return
 
     os.makedirs(STATE_DIR, exist_ok=True)
-    src_record = os.path.join(STATE_DIR, "builder-src")
-
-    # Mounts are fixed when a machine is created, so recreate the builder if
-    # this checkout has moved since it was made
-    if builder_exists() and read_text(src_record) != SRC_DIR:
-        say("source directory changed; recreating builder VM")
-        delete_builder()
-    if not builder_exists():
-        say("creating builder VM")
-        smolvm("machine", "create", "--name", BUILDER,
-               "-s", os.path.join(SRC_DIR, "smolvm", "builder.smolfile"),
-               "-v", SRC_DIR + ":/src:ro", "-v", STATE_DIR + ":/out", quiet=True)
-        write_text(src_record, SRC_DIR)
-
-    say("starting builder VM")
-    smolvm("machine", "start", "--name", BUILDER, quiet=True)
-    try:
-        # dockerd's state must be on the ext4 storage disk (/storage): the
-        # bare VM's root is an overlay that Docker's overlay2 can't stack on.
-        # Bind mounts don't survive a VM restart, so redo them every time.
-        if smolvm("machine", "exec", "--name", BUILDER, "--", "sh", "-c", """
-            set -e
-            for d in docker containerd; do
-                mkdir -p /storage/$d /var/lib/$d
-                mountpoint -q /var/lib/$d || mount --bind /storage/$d /var/lib/$d
-            done
-            if ! docker info >/dev/null 2>&1; then
-                rm -f /var/run/docker.pid
-                setsid dockerd >/var/log/dockerd.log 2>&1 &
-                for i in $(seq 60); do docker info >/dev/null 2>&1 && break; sleep 1; done
-            fi
-            docker info >/dev/null""", check=False) != 0:
-            raise Error("dockerd failed to start in the builder VM")
-
-        say("building image (this takes a while the first time)")
-        if smolvm("machine", "exec", "--stream", "--name", BUILDER, "--",
-                  "docker", "build", "--progress=plain", "-t", "claude-sandbox",
-                  "--build-arg", "AGENT_UID={}".format(os.getuid()),
-                  "--build-arg", "AGENT_GID={}".format(os.getgid()),
-                  "/src", check=False) != 0:
-            raise Error("image build failed")
-
-        say("exporting image")
-        if smolvm("machine", "exec", "--name", BUILDER, "--", "sh", "-c",
-                  "docker save -o /out/image.tar claude-sandbox && "
-                  "docker image prune -f >/dev/null", check=False) != 0:
-            raise Error("image export failed")
-    finally:
-        smolvm("machine", "stop", "--name", BUILDER, check=False, quiet=True)
-
-    # smolvm can only pack a local image archive by way of a machine that has
-    # been booted once (the first boot unpacks the image onto its disk)
-    say("packing image into {}.smolmachine (slow: unpacks and recompresses it)"
-        .format(PACK))
     image = os.path.join(STATE_DIR, "image.tar")
-    tmp = "claude-sandbox-pack-{}".format(os.getpid())
+    say("exporting image")
     try:
-        smolvm("machine", "create", "--name", tmp, "--image", image,
-               "--cpus", CPUS, "--mem", MEM, "--", "sleep", "infinity", quiet=True)
-        smolvm("machine", "start", "--name", tmp, quiet=True)
-        smolvm("machine", "stop", "--name", tmp, quiet=True)
-        for path in (PACK, PACK + ".smolmachine"):
-            remove(path)
-        smolvm("pack", "create", "--from-vm", tmp, "-o", PACK, quiet=True)
+        if subprocess.run(["docker", "save", "-o", image, IMAGE]).returncode != 0:
+            raise Error("image export failed")
+
+        # smolvm can only pack a local image archive by way of a machine that
+        # has been booted once (the first boot unpacks the image onto its disk)
+        say("packing image into {}.smolmachine (slow: unpacks and recompresses it)"
+            .format(PACK))
+        tmp = "claude-sandbox-pack-{}".format(os.getpid())
+        try:
+            smolvm("machine", "create", "--name", tmp, "--image", image,
+                   "--cpus", CPUS, "--mem", MEM, "--", "sleep", "infinity", quiet=True)
+            smolvm("machine", "start", "--name", tmp, quiet=True)
+            smolvm("machine", "stop", "--name", tmp, quiet=True)
+            for path in (PACK, PACK + ".smolmachine", PACK_SOURCE):
+                remove(path)
+            smolvm("pack", "create", "--from-vm", tmp, "-o", PACK, quiet=True)
+            write_text(PACK_SOURCE, new_id)
+        finally:
+            smolvm("machine", "delete", "--name", tmp, "--force", check=False, quiet=True)
     finally:
-        smolvm("machine", "delete", "--name", tmp, "--force", check=False, quiet=True)
-    remove(image)
+        remove(image)
     smolvm("pack", "prune", check=False, quiet=True)
     say("done")
 
@@ -225,24 +219,41 @@ def save_profile(directory, out, login):
 
 # --- sessions ---------------------------------------------------------------
 
-def session(command, profile=None, login=False):
+def session(command, profile=None, login=False, container=False):
+    """Run command in a fresh VM, or with container=True, a Docker container.
+
+    The container gets the host's GPUs but no Docker daemon of its own: that
+    would need a privileged container.
+    """
     if profile:
         directory = profile_dir(profile)
         if not login and not os.path.isfile(os.path.join(directory, "credentials.json")):
             raise Error("no profile named {!r}; create it with: claude-sandbox "
                         "login {}".format(profile, profile))
 
-    if not os.path.isfile(PACK + ".smolmachine"):
-        say("no sandbox image yet; building it first")
-        build()
-
-    args = ["machine", "run", "--from", PACK + ".smolmachine",
-            "--cpus", CPUS, "--mem", MEM, "--storage", STORAGE,
-            "--net", "--net-backend", "virtio-net",
-            "-v", os.getcwd() + ":" + GUEST_PROJECT, "-w", GUEST_PROJECT,
-            "-e", "TERM=" + os.environ.get("TERM", "xterm-256color")]
-    if sys.stdin.isatty():
-        args += ["-i", "-t"]
+    if container:
+        need("docker")
+        if not image_id():
+            say("no sandbox image yet; building it first")
+            build()
+        args = ["docker", "run", "--rm", "--init", "-i",
+                "--cpus", CPUS, "--memory", MEM + "m", "-e", "SANDBOX_DOCKER=0"]
+        if GPUS:
+            args += ["--gpus=" + GPUS]
+        if sys.stdin.isatty():
+            args += ["-t"]
+    else:
+        need("smolvm")
+        if not os.path.isfile(PACK + ".smolmachine"):
+            say("no sandbox image yet; building it first")
+            build()
+        args = ["smolvm", "machine", "run", "--from", PACK + ".smolmachine",
+                "--cpus", CPUS, "--mem", MEM, "--storage", STORAGE,
+                "--net", "--net-backend", "virtio-net"]
+        if sys.stdin.isatty():
+            args += ["-i", "-t"]
+    args += ["-v", os.getcwd() + ":" + GUEST_PROJECT, "-w", GUEST_PROJECT,
+             "-e", "TERM=" + os.environ.get("TERM", "xterm-256color")]
 
     # virtiofs can only share directories, so hand ~/.gitconfig over by value
     gitconfig = os.path.join(HOME, ".gitconfig")
@@ -265,13 +276,16 @@ def session(command, profile=None, login=False):
             args += ["-v", scratch + ":" + GUEST_PROFILE,
                      "-e", "SANDBOX_PROFILE_DIR=" + GUEST_PROFILE]
 
-        args += ["--", ENTRYPOINT] + command
+        if container:
+            args += [IMAGE] + command
+        else:
+            args += ["--", ENTRYPOINT] + command
 
         # Keystrokes go to the guest through the raw TTY, but don't let a
         # stray SIGINT kill this process before it saves the profile. A
-        # handler (unlike SIG_IGN) isn't inherited by smolvm.
+        # handler (unlike SIG_IGN) isn't inherited by smolvm or docker.
         signal.signal(signal.SIGINT, lambda *_: None)
-        status = smolvm(*args, check=False)
+        status = subprocess.run(args).returncode
 
         if profile:
             save_profile(directory, os.path.join(scratch, "out"), login)
@@ -309,23 +323,29 @@ def remove(path):
 
 USAGE = """\
 usage: claude-sandbox run PROFILE          run Claude Code in the current directory
+       claude-sandbox run-container PROFILE
+                                           the same, in a Docker container with
+                                           the host's GPUs (no Docker inside)
        claude-sandbox login PROFILE        log in and save a profile (e.g. personal, work)
        claude-sandbox profiles             list saved profiles
        claude-sandbox shell [PROFILE]      run zsh instead
        claude-sandbox exec CMD [ARG...]    run any command, without a profile
-       claude-sandbox build                (re)build the sandbox image
-       claude-sandbox clean                delete the builder VM and built image
+       claude-sandbox build                (re)build the container image and,
+                                           if smolvm is installed, the VM image
+       claude-sandbox clean                delete the built images
 
 Profiles hold a Claude Code login, so sessions start logged in. Nothing else
 from a session's ~/.claude is kept: no history, memories or settings changes.
 
 Environment:
-  CLAUDE_SANDBOX_CPUS      vCPU cap (default: 4)
+  CLAUDE_SANDBOX_CPUS      CPU cap (default: 4)
   CLAUDE_SANDBOX_MEM       memory cap in MiB (default: 4096; only touched
                            memory is committed on the host)
-  CLAUDE_SANDBOX_STORAGE   per-session disk in GiB, holds Docker's images and
-                           containers (default: 20)
-  CLAUDE_SANDBOX_HOME      image and builder state
+  CLAUDE_SANDBOX_STORAGE   per-VM disk in GiB, holds Docker's images and
+                           containers (default: 20; not used by containers)
+  CLAUDE_SANDBOX_GPUS      GPUs for containers, as for docker run --gpus
+                           (default: all; empty for none)
+  CLAUDE_SANDBOX_HOME      VM image state
                            (default: ~/.cache/claude-sandbox)
   CLAUDE_SANDBOX_PROFILES  saved profiles
                            (default: ~/.config/claude-sandbox/profiles)
@@ -336,7 +356,8 @@ def main(argv):
     parser = argparse.ArgumentParser(prog="claude-sandbox", usage=USAGE, add_help=False)
     parser.add_argument("command", nargs="?")
     parser.add_argument("args", nargs=argparse.REMAINDER)
-    opts = parser.parse_args(argv)
+    # argparse would reject -h/--help itself, since add_help is off
+    opts = parser.parse_args(["help"] if argv[:1] in (["-h"], ["--help"]) else argv)
     cmd, args = opts.command, opts.args
 
     def want(lo, hi):
@@ -348,13 +369,12 @@ def main(argv):
         sys.stdout.write(USAGE)
         return 0 if cmd else 2
 
-    if shutil.which("smolvm") is None:
-        raise Error("smolvm not found; install it with: "
-                    "curl -sSL https://smolmachines.com/install.sh | bash")
-
     if cmd == "run":
         want(1, 1)
         return session(CLAUDE_CMD, profile=args[0])
+    if cmd == "run-container":
+        want(1, 1)
+        return session(CLAUDE_CMD, profile=args[0], container=True)
     if cmd == "login":
         want(1, 1)
         say("log in, then /quit to save the profile")
@@ -378,9 +398,14 @@ def main(argv):
         return 0
     if cmd == "clean":
         want(0, 0)
-        delete_builder()
+        if shutil.which("docker") and image_id():
+            subprocess.run(["docker", "image", "rm", IMAGE], stdout=subprocess.DEVNULL)
         shutil.rmtree(STATE_DIR, ignore_errors=True)
-        smolvm("pack", "prune", check=False, quiet=True)
+        if shutil.which("smolvm"):
+            if OLD_BUILDER in smolvm_output("machine", "ls", "--quiet").split():
+                smolvm("machine", "stop", "--name", OLD_BUILDER, check=False, quiet=True)
+                smolvm("machine", "delete", "--name", OLD_BUILDER, "--force", quiet=True)
+            smolvm("pack", "prune", check=False, quiet=True)
         return 0
 
     raise Error("unknown command: {} (try --help)".format(cmd))

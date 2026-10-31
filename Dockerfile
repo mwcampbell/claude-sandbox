@@ -1,6 +1,7 @@
 # Sandbox image for running Claude Code with --dangerously-skip-permissions.
 # Booted as a smolvm microVM by ./claude-sandbox, with Docker Engine running
-# inside the VM.
+# inside the VM, or run directly as a Docker container (without Docker inside)
+# by `claude-sandbox run-container`.
 # Base: Ubuntu 26.04 LTS (broad package availability, well-trodden by CLI tools/agents)
 FROM ubuntu:26.04
 
@@ -60,7 +61,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_${NODE_MAJOR}.x | bash - && \
     rm -rf /var/lib/apt/lists/*
 
 # Docker Engine (Docker's own apt repo), so the agent can build and run
-# containers inside the VM
+# containers inside the VM (container mode leaves it unused)
 RUN install -m 0755 -d /etc/apt/keyrings && \
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc && \
     chmod a+r /etc/apt/keyrings/docker.asc && \
